@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Симулятор передачи пакета по линии</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            color: #222;
+        }
+        h1 { font-size: 20px; margin-top: 0; }
+        .controls {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            margin-bottom: 15px;
+        }
+        .controls label { margin-right: 6px; font-weight: bold; }
+        .controls select { margin-right: 20px; padding: 4px; }
+        button {
+            padding: 8px 18px;
+            margin-right: 8px;
+            border: none;
+            border-radius: 5px;
+            background: #2b6cb0;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        button:hover { background: #1e4e87; }
+        button:disabled { background: #aaa; cursor: not-allowed; }
+        canvas {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            display: block;
+        }
+        .info {
+            margin-top: 12px;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .info span { font-weight: bold; color: #2b6cb0; }
+    </style>
+</head>
+<body>
+
+<h1>Симулятор передачи пакета по линии</h1>
+
+<div class="controls">
+    <label>Длина:</label>
+    <select id="length">
+        <option value="10000">10 км</option>
+        <option value="100000">100 км</option>
+        <option value="1000000" selected>1000 км</option>
+    </select>
+
+    <label>Скорость:</label>
+    <select id="rate">
+        <option value="512000">512 kbps</option>
+        <option value="1000000">1 Mbps</option>
+        <option value="10000000">10 Mbps</option>
+        <option value="100000000" selected>100 Mbps</option>
+    </select>
+
+    <label>Размер пакета:</label>
+    <select id="size">
+        <option value="800">100 байт</option>
+        <option value="4000">500 байт</option>
+        <option value="8000" selected>1000 байт</option>
+    </select>
+
+    <button id="startBtn">Старт</button>
+    <button id="resetBtn">Сброс</button>
+</div>
+
+<canvas id="canvas" width="900" height="220"></canvas>
+
+<div class="info" id="info">
+    Нажмите «Старт», чтобы запустить симуляцию.
+</div>
+
+<script>
+// === Константы физики ===
+const CELERITY = 2.8e8; // м/с — скорость сигнала в кабеле
+
+// === Ссылки на DOM ===
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+const startBtn = document.getElementById('startBtn');
+const resetBtn = document.getElementById('resetBtn');
+const selLength = document.getElementById('length');
+const selRate = document.getElementById('rate');
+const selSize = document.getElementById('size');
+
+// === Геометрия отрисовки ===
+const LINE_X = 120;
+const LINE_Y = 90;
+const LINE_W = 660;
+const LINE_H = 20;
+const SENDER_X = 40;
+const RECEIVER_X = 810;
+
+// === Состояние симуляции ===
+let animId = null;
+let simStartMs = 0;
+let totalTime = 0;    // секунды
+let emissionTime = 0; // секунды
+let propagationTime = 0; // секунды
+let currentTime = 0;
+
+function readParams() {
+    const L = parseFloat(selLength.value); // метры
+    const R = parseFloat(selRate.value);   // бит/сек
+    const S = parseFloat(selSize.value);   // биты
+    emissionTime = S / R;
+    propagationTime = L / CELERITY;
+    totalTime = emissionTime + propagationTime;
+    return { L, R, S };
+}
+
+function formatMs(seconds) {
+    return (seconds * 1000).toFixed(4) + ' мс';
+}
+
+function drawBase() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Линия
+    ctx.fillStyle = '#eee';
+    ctx.fillRect(LINE_X, LINE_Y, LINE_W, LINE_H);
+    ctx.strokeStyle = '#888';
+    ctx.strokeRect(LINE_X, LINE_Y, LINE_W, LINE_H);
+
+    // Отправитель
+    ctx.fillStyle = '#4a90e2';
+    ctx.fillRect(SENDER_X, LINE_Y - 10, 60, 40);
+    ctx.fillStyle = '#000';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Sender', SENDER_X + 30, LINE_Y + 50);
+
+    // Получатель
+    ctx.fillStyle = '#4a90e2';
+    ctx.fillRect(RECEIVER_X, LINE_Y - 10, 60, 40);
+    ctx.fillStyle = '#000';
+    ctx.fillText('Receiver', RECEIVER_X + 30, LINE_Y + 50);
+
+    // Заголовок с временем
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 14px Arial';
+    ctx.fillStyle = '#222';
+    ctx.fillText('Время: ' + formatMs(currentTime), 30, 30);
+
+    // Прогресс
+    ctx.font = '12px Arial';
+    ctx.fillStyle = '#666';
+    ctx.fillText('Эмиссия: ' + formatMs(emissionTime) +
+                 '   |   Распространение: ' + formatMs(propagationTime) +
+                 '   |   Итого: ' + formatMs(totalTime), 30, 55);
+}
+
+/**
+ * Рисует пакет. Пакет начинает "выходить" из отправителя в момент t=0
+ * и полностью выходит в момент t = emissionTime.
+ * Его хвост стартует из позиции sender в момент 0,
+ * его голова стартует из позиции sender в момент emissionTime.
+ * Далее обе точки летят по кабелю со скоростью CELERITY.
+ *
+ * Позиция на экране (0..1) = (t - t0) * CELERITY / L
+ */
+function drawPacket(t) {
+    if (t > totalTime) return;
+
+    // Время, когда хвост покинул передатчик
+    const tailTime = 0;
+    // Время, когда голова покинула передатчик
+    const headTime = emissionTime;
+
+    // Позиции на линии (0..1) для хвоста и головы
+    // В момент t: точка, вышедшая из передатчика в момент t0,
+    // прошла путь (t - t0) * CELERITY метров => доля (t - t0)*C/L
+    let headPos = ((t - headTime) * CELERITY) / currentLineLength();
+    let tailPos = ((t - tailTime) * CELERITY) / currentLineLength();
+
+    // Ограничим 0..1
+    headPos = Math.max(0, Math.min(1, headPos));
+    tailPos = Math.max(0, Math.min(1, tailPos));
+
+    // Если голова ещё не вышла из передатчика — значит пакет ещё эмитируется.
+    // Пока t < emissionTime, хвост ещё "внутри" передатчика (tailPos=0),
+    // а голова уже движется (headPos >= 0).
+    if (t < emissionTime) {
+        tailPos = 0;
+    }
+
+    // Если хвост дошёл до получателя — пакет полностью принят
+    if (tailPos >= 1) return;
+
+    const x1 = LINE_X + headPos * LINE_W;
+    const x2 = LINE_X + tailPos * LINE_W;
+
+    // Рисуем пакет (от меньшей координаты к большей)
+    const left = Math.min(x1, x2);
+    const width = Math.abs(x1 - x2);
+
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillRect(left, LINE_Y + 2, width, LINE_H - 4);
+}
+
+let _cachedLength = 1000000;
+function currentLineLength() { return _cachedLength; }
+
+function tick(timestamp) {
+    if (!simStartMs) simStartMs = timestamp;
+
+    // Масштаб: реальный totalTime (например 3.6 мс) растянем на 4 секунды
+    const SCALE_MS = 4000;
+    const elapsed = timestamp - simStartMs;
+    currentTime = (elapsed / SCALE_MS) * totalTime;
+
+    drawBase();
+    drawPacket(currentTime);
+
+    if (currentTime < totalTime * 1.05) {
+        animId = requestAnimationFrame(tick);
+    } else {
+        finish();
+    }
+}
+
+function finish() {
+    animId = null;
+    startBtn.disabled = false;
+    resetBtn.disabled = false;
+    info.innerHTML = `✅ Пакет доставлен за <span>${formatMs(totalTime)}</span> ` +
+        `(эмиссия: ${formatMs(emissionTime)}, распространение: ${formatMs(propagationTime)})`;
+}
+
+function startSim() {
+    if (animId) cancelAnimationFrame(animId);
+    const p = readParams();
+    _cachedLength = p.L;
+
+    // Для очень маленького totalTime — увеличим масштаб, чтобы было видно
+    // (3.6 мс за 4 секунды — норм; 0.08 мс — тоже ок)
+    simStartMs = 0;
+    currentTime = 0;
+    startBtn.disabled = true;
+    resetBtn.disabled = true;
+    info.textContent = 'Симуляция идёт...';
+    animId = requestAnimationFrame(tick);
+}
+
+function resetSim() {
+    if (animId) cancelAnimationFrame(animId);
+    animId = null;
+    simStartMs = 0;
+    currentTime = 0;
+    startBtn.disabled = false;
+    resetBtn.disabled = false;
+    readParams();
+    drawBase();
+    info.textContent = 'Нажмите «Старт», чтобы запустить симуляцию.';
+}
+
+startBtn.addEventListener('click', startSim);
+resetBtn.addEventListener('click', resetSim);
+
+// Первичная инициализация
+readParams();
+drawBase();
+</script>
+
+</body>
+</html>
